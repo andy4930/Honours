@@ -22,7 +22,7 @@ if __name__ == '__main__':
     parser.add_argument("--num_per_class", type=int, default=10)
 
     '''DiffWave-VPSDE arguments'''
-    parser.add_argument('--ddpm_config', type=str, default='configs/config_ori.json', help='JSON file for configuration')
+    parser.add_argument('--ddpm_config', type=str, default='configs/config.json', help='JSON file for configuration')
     parser.add_argument('--diffwav_path', type=str, default=None, help='dir of diffusion model checkpoint')
     parser.add_argument('--diffspec_path', type=str, default=None, help='dir of diffusion model checkpoint')
     parser.add_argument('--sample_step', type=int, default=1, help='Total sampling steps')
