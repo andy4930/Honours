@@ -1,0 +1,3 @@
+The official pytorch implementation of DualPure proposed in paper **DualPure: An Efficient Adversarial Purification Method for Speech Command Recognition**. Accepted to **Interspeech 2024**.
+
+The codes, data and details is coming soon...
