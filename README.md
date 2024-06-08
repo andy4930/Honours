@@ -8,9 +8,9 @@ Since our codes are based on [AudioPure](https://github.com/cychomatica/AudioPur
 Then replace part of the codes with our release.
 
 ## Environment
-Create a new conda environment of Python 3.8 called DualPure.
+Create a new conda environment of Python 3.9 called DualPure.
 ```
-conda create -n DualPure python=3.8
+conda create -n DualPure python=3.9
 conda activate DualPure
 pip install -r requirements.txt
 ```
