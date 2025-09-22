@@ -9,6 +9,8 @@ import torchaudio
 from robustness_eval.black_box_attack import *
 import utils
 
+from andy_diffdef_audio import MultiDiff
+
 # torch.manual_seed(42)
 
 if __name__ == '__main__':
@@ -35,7 +37,9 @@ if __name__ == '__main__':
     
     '''attack arguments'''
     parser.add_argument('--attack', type=str, choices=['PGD', 'FAKEBOB'], default='PGD')
-    parser.add_argument('--defense', type=str, choices=['DualPure', 'AudioPure', 'DDPM', 'DiffNoise', 'DiffRev', 'OneShot', 'DiffSpec', 'None'], default='None')
+    parser.add_argument('--defense', type=str, choices=['DualPure', 'AudioPure', 'DDPM', 'DiffNoise', 'DiffRev', 'OneShot', 'DiffSpec', 'MultiDiff','None'], default='None')
+    parser.add_argument('--defense_type', type=str, choices=['wave','spec'], default='wave',
+                    help='where to apply the defense (waveform or spectrogram)') # Added by Andy
     parser.add_argument('--bound_norm', type=str, choices=['linf', 'l2'], default='linf')
     parser.add_argument('--eps', type=float, default=0.002)  # l2=0.253
     parser.add_argument('--max_iter_1', type=int, default=10)
@@ -43,9 +47,14 @@ if __name__ == '__main__':
     parser.add_argument('--eot_attack_size', type=int, default=1, help='EOT size of attack')
     parser.add_argument('--eot_defense_size', type=int, default=1)
     parser.add_argument('--verbose', type=int, default=0)
+    parser.add_argument('--rand_inits', type=int, default=3) # Added by Andy
+    parser.add_argument('--select', type=str, choices=['mse_wave','mse_mel','logit_margin'],
+                    default='mse_wave', help='candidate scoring for MultiDiff') #Added by Andy
+    parser.add_argument('--bpda_mode', type=str, choices=['identity','surrogate'], default='surrogate') # Added by Andy
+    parser.add_argument('--bpda_t', type=int, default=5) # Added by Andy
 
     '''device arguments'''
-    parser.add_argument("--dataload_workers_nums", type=int, default=8, help='number of workers for dataloader')
+    parser.add_argument("--dataload_workers_nums", type=int, default=4, help='number of workers for dataloader')
     parser.add_argument("--batch_size", type=int, default=1, help='batch size')
     parser.add_argument('--gpu', type=int, default=0)
 
@@ -65,6 +74,19 @@ if __name__ == '__main__':
     from datasets.sc_dataset import *
     from audio_models.create_model import *
 
+    # Added by Andy - for -- select logit_margin
+    class WaveClassifier(torch.nn.Module):
+        # Wraps a spectrogram classifier so it can accept waveform [B,1,T].
+        def __init__(self, base: torch.nn.Module, to_mel_fn):
+            super().__init__()
+            self.base = base
+            self.to_mel = to_mel_fn
+        def forward(self, x_wave: torch.Tensor):
+            spec = self.to_mel(x_wave)          # [B, M, T’]
+            if spec.dim() == 3:
+                spec = spec.unsqueeze(1)        # [B, 1, M, T’]
+            return self.base(spec)
+    
     print('create classifier from {}'.format(args.classifier_path))
     Classifier = create_model(args.classifier_path)
     if use_gpu:
@@ -85,14 +107,19 @@ if __name__ == '__main__':
     Amp2DB = torchaudio.transforms.AmplitudeToDB(stype='power')
     Wave2Spect = Compose([MelSpecTrans.cuda(), Amp2DB.cuda()])
 
-    defense_method_all = ['DualPure', 'AudioPure', 'DDPM', 'DiffNoise', 'DiffRev', 'OneShot', 'DiffSpec']
+    # Added by Andy
+    ClsForMargin = WaveClassifier(Classifier, Wave2Spect).eval()
+    if use_gpu:
+        ClsForMargin.cuda()
+
+    defense_method_all = ['DualPure', 'AudioPure', 'DDPM', 'DiffNoise', 'DiffRev', 'OneShot', 'DiffSpec', 'MultiDiff']
     '''defense setting'''
     from acoustic_system import AcousticSystem_robust
     if args.defense == 'None':
         if Classifier._get_name() == 'M5': # M5Net takes the raw audio as input
             AS_MODEL = AcousticSystem_robust(classifier=Classifier, transform=None, defender=None)
         else: 
-            AS_MODEL = AcousticSystem_robust(classifier=Classifier, transform=Wave2Spect, defender=None)
+            AS_MODEL = AcousticSystem_robust(classifier=Classifier, transform=Wave2Spect, defender_wav=None, defender_spec=None, defense_method='None') # Changed by Andy
         print('classifier model: {}'.format(Classifier._get_name()))
         print('defense: None')
 
@@ -100,21 +127,86 @@ if __name__ == '__main__':
         if args.defense in defense_method_all:
             from diffusion_models.diffwave_sde import *
             from diffusion_models.improved_diffusion_sde import *
-            Defender_wav = RevDiffWave(args)
-            Defender_spec = RevImprovedDiffusion(args)
+            Defender_wav_base = RevDiffWave(args)
+            Defender_spec_base = RevImprovedDiffusion(args)
         else:
             raise NotImplementedError(f'Unknown defense: {args.defense}!')
         
-        if Classifier._get_name() == 'M5':
-            AS_MODEL = AcousticSystem_robust(classifier=Classifier, transform=None, defender_wav=Defender_wav, defense_method=args.defense)
-        else: 
-            AS_MODEL = AcousticSystem_robust(classifier=Classifier, transform=Wave2Spect, defender_wav=Defender_wav, defender_spec=Defender_spec, defense_method=args.defense)
+        defender_wav = None
+        defender_spec = None
+
+        if args.defense == 'AudioPure':
+            defender_wav = Defender_wav_base
+
+        elif args.defense == 'DualPure':
+            defender_wav = Defender_wav_base
+            defender_spec = Defender_spec_base
+
+        elif args.defense == 'DiffSpec':
+            defender_spec = Defender_spec_base
+
+        elif args.defense == 'DDPM' or args.defense == 'DiffNoise' or args.defense == 'DiffRev' or args.defense == 'OneShot':
+            defender_wav = Defender_wav_base
+
+        elif args.defense == 'MultiDiff':
+            # Waveform variant
+            if args.defense_type == 'wave':
+                defender_wav = MultiDiff(
+                    purifier=Defender_wav_base,
+                    reverse_timestep=args.t,
+                    sample_step=args.sample_step,
+                    rand_inits=args.rand_inits,
+                    select=args.select,
+                    classifier=ClsForMargin if args.select == 'logit_margin' else None,
+                    to_mel_fn=Wave2Spect if args.select == 'mse_mel' else None,
+                    bpda_mode=args.bpda_mode,
+                    bpda_t=args.bpda_t,
+                )
+            # Spectrogram variant (optional)
+            # elif args.defense_type == 'spec':
+            #     defender_spec = MultiDiff(
+            #         purifier=Defender_spec_base,
+            #         reverse_timestep=args.t,
+            #         sample_step=args.sample_step,
+            #         rand_inits=args.rand_inits,
+            #         select='mse_wave',
+            #         classifier=None,
+            #         to_mel_fn=None,
+            #         bpda_mode=args.bpda_mode,
+            #         bpda_t=args.bpda_t,
+            #    )
+            else:
+                raise ValueError(f"Unknown defense_type: {args.defense_type}")
+
+        
+        if Classifier._get_name() == 'M5':  # raw-audio classifier
+            AS_MODEL = AcousticSystem_robust(
+                classifier=Classifier, transform=None,
+                defender_wav=defender_wav, defender_spec=defender_spec,
+                defense_type=args.defense_type, defense_method=args.defense
+            )
+        else:
+            AS_MODEL = AcousticSystem_robust(
+                classifier=Classifier, transform=Wave2Spect,
+                defender_wav=defender_wav, defender_spec=defender_spec,
+                defense_type=args.defense_type, defense_method=args.defense
+            )
+
         print('classifier model: {}'.format(Classifier._get_name()))
+
         if args.defense == 'Diffusion':
-            print('defense: {} with t={}, s={}'.format(Defender_wav._get_name(), args.t, args.sample_step))
+            print('defense: {} with t={}, s={}'.format(Defender_wav_base._get_name(), args.t, args.sample_step))
             print('diffusion type: {}'.format(args.diffusion_type))
         else:
-            print('defense: {}'.format(Defender_wav._get_name()))
+            print('defense: {}'.format(Defender_wav_base._get_name()))
+        
+        if defender_wav is not None:
+            print(f'defense (wave): {defender_wav._get_name() if hasattr(defender_wav, "_get_name") else type(defender_wav).__name__}')
+        if defender_spec is not None:
+            print(f'defense (spec): {defender_spec._get_name() if hasattr(defender_spec, "_get_name") else type(defender_spec).__name__}')
+        if args.defense == 'MultiDiff':
+            print(f'MultiDiff params: t={args.t}, step={args.sample_step}, rand_inits={args.rand_inits}, select={args.select}')
+
     AS_MODEL.eval()
 
     '''attack setting'''
@@ -133,8 +225,8 @@ if __name__ == '__main__':
         eps = args.eps
         confidence = 0.5
         max_iter = 200
-        samples_per_draw = 200
-        samples_per_draw_batch_size = 50
+        samples_per_draw = 200 # or 20 
+        samples_per_draw_batch_size = 10
         Attacker = FAKEBOB(model=AS_MODEL, task='SCR', targeted=False, verbose=args.verbose,
                            confidence=confidence, epsilon=eps, max_lr=0.001, min_lr=1e-6,
                            max_iter=max_iter, samples_per_draw=samples_per_draw, samples_per_draw_batch_size=samples_per_draw_batch_size, batch_size=args.batch_size)
